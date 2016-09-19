@@ -5,18 +5,281 @@ date: "7 Sep 2016"
 output: html_document
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+```{r}
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+library(knitr)
+
+library(caret)
+
+set.seed(5456)
+
+```
+
+```{r loaddata, cache=TRUE}
+
+# Download training and testing data, if necessary
+
+trainfile <- "pml-training.csv"
+testfile <- "pml-testing.csv"
+
+trainurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testurl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+if (!file.exists(trainfile))
+{
+    download.file(trainurl, trainfile)
+}
+
+if (!file.exists(testfile))
+{
+    download.file(testurl, testfile)
+}
+
+# Load the training and testing data into data frames
+
+# Just leaving this snippet here for future reference (reading CSV headers
+# into a vector):
+# traininghead <- readLines(trainfile, n = 10)
+# trainingnames <- scan(text = traininghead[1], what = "character", sep = ",")
+
+liftdata <- read.csv(trainfile, as.is = TRUE, na.strings = c("NA", "#DIV/0!"))
+predictiondata <- read.csv(testfile, as.is = TRUE)
+
+liftdata$classe <- factor(liftdata$classe)
+liftdata$new_window <- factor(liftdata$new_window,
+                                  levels = c("no", "yes"))
+
+# Column indices for data columns
+datacol.ind <- 8:ncol(liftdata)
+
+dropcols <- integer(0)
+for (ind in datacol.ind)
+{
+    if (all(is.na(liftdata[, ind])))
+        dropcols <- c(dropcols, ind)
+}
+
+# Calculate the fraction of missing values for each column
+na.frac <- apply(liftdata, 2, function(x) mean(is.na(x)))
+
+# Drop columns which have at least 20 % NAs (seems that any value between
+# epsilon and 0.97 would yield the same result...)
+liftdata <- liftdata[, na.frac < 0.2]
+
+# Convert all columns of type "integer" to numeric
+
+# Determine column types
+coltypes <- sapply(liftdata, class)
+# Ignore first 7 columns (identifying data)
+coltypes[1:7] <- ""
+
+intcols <- which(coltypes == "integer")
+
+liftdata[, intcols] <- sapply(liftdata[, intcols], as.numeric)
+
+
+datacol.ind <- 8:ncol(liftdata)
+
+```
+
+```{r initforeach}
+# Initialize parallel or sequential backend for 'foreach'
+
+library(doMC)
+
+# Explicitly register a sequential backend
+
+registerDoSEQ()
+
+# Create a function for initalizing a seed list (for reproducibility)
+createSeedList <- function(nrand, ntune)
+{
+    seeds <- vector(mode = "list", length = nrand + 1)
+    
+    for (i in 1:nrand)
+        seeds[[i]] <- sample.int(10000, ntune)
+    
+    seeds[[nrand + 1]] <- sample.int(10000, 1)
+    
+    return(seeds)
+}
+```
+
+# Introduction
+
+This report presents a statistical model for interpreting human activity data. More specifically, the aim is to determine from accelerometer data whether a weight lifting exercise was performed correctly or not.
+
+# Prediction model
+
+## Training, testing, and validation data
+
+```{r partdata}
+
+inTrain <- createDataPartition(liftdata$classe, p = 0.6, list = FALSE)
+
+training <- liftdata[inTrain, ]
+test.valid <- liftdata[-inTrain, ]
+
+inTest <- createDataPartition(test.valid$classe, p = 0.5, list = FALSE)
+
+testing <- test.valid[inTest, ]
+validation <- test.valid[-inTest, ]
+```
+
+## Cross-validation parameters
+
+```{r cvpar, cache=TRUE}
+# Changing this chunk will invalidate the caches of the model fitting
+# chunks. Re-running them takes a long time. You have been warned.
+
+nfold <- 10L
+nrepeat <- 5L
+```
+
+The out-of-sample error of the prediction models is estimated using repeated
+cross-validation with `r nfold` folds, repeated `r nrepeat` times for each model.
+
+## Prediction by linear discriminant analysis
+
+```{r pred.lda, cache=TRUE, dependson='cvpar'}
+trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
+
+mod.lda <- train(classe ~ ., training[, datacol.ind], method = "lda",
+                 metric = "Accuracy", trControl = trC)
+
+pred.lda <- predict(mod.lda, training)
+pred.testing.lda <- predict(mod.lda, testing)
+```
 
 ```{r}
-summary(cars)
+print(mod.lda)
+
+#library(MASS)
+
+#plot(mod.lda$finalModel)
+
+confusionMatrix(pred.testing.lda, testing$classe)
 ```
 
-You can also embed plots, for example:
+## Prediction using a tree
 
-```{r, echo=FALSE}
-plot(cars)
+```{r pred.tree, cache=TRUE}
+trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
+
+mod.tree <- train(classe ~ ., training[, datacol.ind], method = "rpart", metric = "Accuracy", trControl = trC)
+
+pred.tree <- predict(mod.tree, training)
+pred.testing.tree <- predict(mod.tree, testing)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+print(mod.tree)
+
+#library(rpart)
+
+#plot(mod.tree$finalModel)
+
+confusionMatrix(pred.testing.tree, testing$classe)
+
+```
+
+## Prediction using boosting (GBM)
+
+```{r pred.gbm, cache=TRUE, dependson='cvpar'}
+# Parameter tuning grid
+tunegrid <- expand.grid(interaction.depth=c(2, 3, 4, 5),
+                        n.trees = c(50, 100, 150, 200, 250, 300))
+tunegrid <- cbind(tunegrid, shrinkage = 0.1, n.minobsinnode = 10)
+
+set.seed(0132)
+npar = nrow(tunegrid)
+seeds.gbm <- createSeedList(nfold*nrepeat, npar)
+
+registerDoMC(4)
+
+trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
+
+t1gbm <- proc.time()
+
+mod.gbm <- train(classe ~ ., training[, datacol.ind], method = "gbm", metric = "Accuracy", trControl = trC, tuneGrid = tunegrid)
+
+t2gbm <- proc.time()
+
+pred.gbm <- predict(mod.gbm, training)
+pred.testing.gbm <- predict(mod.gbm, testing)
+
+registerDoSEQ()
+```
+
+```{r}
+print(mod.gbm)
+
+varImp(mod.gbm)
+
+plot(mod.gbm$finalModel)
+```
+
+Execution time: `r (t2gbm-t1gbm)["elapsed"]`
+
+## Prediction using random forest
+
+```{r pred.rf, cache=TRUE, dependson='cvpar'}
+# Using the formula method for rf seems to be very slow; sources suggest
+# using the y = ..., x = ... format instead.
+#mod.rf <- train(classe ~ ., training[, datacol.ind], method = "rf", mtry = 1)
+
+# Spread calculations over 4 cores
+registerDoMC(4)
+
+# Create seeds for parallel processing
+set.seed(5456)
+
+tuneLength = 5L # rf has only one parameter tuned by caret (mtry)
+
+#seeds <- vector(mode = "list", length = nfold*nrepeat + 1)
+
+#for (i in 1:(nfold*nrepeat)) seeds[[i]] <- sample.int(10000, tuneLength)
+
+#seeds[[nfold*nrepeat + 1]] <- sample.int(10000, 1)
+
+seeds <- createSeedList(nfold*nrepeat, tuneLength)
+
+trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat,
+                    seeds = seeds, allowParallel = TRUE)
+
+t1rf <- proc.time()
+
+rfdata <- training[, setdiff(datacol.ind, match("classe", names(training)))]
+mod.rf <- train(y = training$classe, x = rfdata,
+                method = "rf", trControl = trC, do.trace = TRUE, ntree = 250,
+                tuneLength = tuneLength)
+
+t2rf <- proc.time()
+
+pred.rf <- predict(mod.rf, training)
+pred.testing.rf <- predict(mod.rf, testing)
+
+t3rf <- proc.time()
+```
+
+```{r}
+print(mod.rf)
+
+#plot(mod.rf$finalModel)
+
+class(mod.rf$finalModel)
+
+varImp(mod.rf)
+
+varImpPlot(mod.rf$finalModel)
+
+confusionMatrix(pred.testing.rf, testing$classe)
+
+plot(mod.rf$finalModel)
+```
+
+Execution time: `r (t2rf-t1rf)["elapsed"]`
+
+# Sources
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. *Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13)* . Stuttgart, Germany: ACM SIGCHI, 2013. <http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises>
