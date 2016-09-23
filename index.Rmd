@@ -1,18 +1,44 @@
 ---
-title: "Untitled"
+title: "Predicting weight lifting method via accelerometry data"
 author: "Timo Voipio"
-date: "7 Sep 2016"
+date: "21 Sep 2016"
 output: html_document
 ---
 
-```{r}
+```{r init.knitr, echo=FALSE}
+
+# TRUE disables echo by default and disables warnings and messages
+tidydoc <- TRUE
+
+warnstat <- getOption("warn")
+
+if (tidydoc)
+{
+    options(warn = -1)
+}
 
 library(knitr)
 
+options(warn = warnstat)
+
+# figure width 4 inches (PDF output), height = width, center figures
+opts_chunk$set(fig.width=4, fig.height=4, fig.align='center',
+               fig.retina = 2, dpi = 96)
+
+# Increase the penalty for using scientific notation (to format
+# numbers like 10000 normally, not in scientific notation)
+options(scipen = 3)
+
+if (tidydoc)
+{
+    opts_chunk$set(echo=FALSE, warnings=FALSE, messages=FALSE)
+}
+```
+
+```{r init.libraries, warning=FALSE, message=FALSE}
 library(caret)
 
 set.seed(5456)
-
 ```
 
 ```{r loaddata, cache=TRUE}
@@ -43,43 +69,48 @@ if (!file.exists(testfile))
 # trainingnames <- scan(text = traininghead[1], what = "character", sep = ",")
 
 liftdata <- read.csv(trainfile, as.is = TRUE, na.strings = c("NA", "#DIV/0!"))
-predictiondata <- read.csv(testfile, as.is = TRUE)
+predictiondata <- read.csv(testfile, as.is = TRUE, na.strings = c("NA", "#DIV/0!"))
 
 liftdata$classe <- factor(liftdata$classe)
 liftdata$new_window <- factor(liftdata$new_window,
                                   levels = c("no", "yes"))
 
+predictiondata$new_window <- factor(predictiondata$new_window,
+                                  levels = c("no", "yes"))
+
 # Column indices for data columns
 datacol.ind <- 8:ncol(liftdata)
 
-dropcols <- integer(0)
-for (ind in datacol.ind)
-{
-    if (all(is.na(liftdata[, ind])))
-        dropcols <- c(dropcols, ind)
-}
-
-# Calculate the fraction of missing values for each column
-na.frac <- apply(liftdata, 2, function(x) mean(is.na(x)))
-
 # Drop columns which have at least 20 % NAs (seems that any value between
 # epsilon and 0.97 would yield the same result...)
-liftdata <- liftdata[, na.frac < 0.2]
+na.frac.limit <- 0.2
 
-# Convert all columns of type "integer" to numeric
+cleanColumns <- function(df, threshold)
+{
+    # Calculate the fraction of missing values for each column
+    # and discard with fraction equal to or greater than the threshold
+    na.frac <- apply(df, 2, function(x) mean(is.na(x)))
+    outdf <- df[, na.frac < threshold]
+    
+    # Determine column types
+    coltypes <- sapply(outdf, class)
+    # Ignore first 7 columns (identifying data)
+    coltypes[1:7] <- ""
+    if ("problem_id" %in% names(df))
+        coltypes[match("problem_id", names(df))] <- ""
+    
+    intcols <- which(coltypes == "integer")
+    outdf[, intcols] <- sapply(outdf[, intcols], as.numeric)
+    
+    return(list(df = outdf, na.frac = na.frac))
+}
 
-# Determine column types
-coltypes <- sapply(liftdata, class)
-# Ignore first 7 columns (identifying data)
-coltypes[1:7] <- ""
-
-intcols <- which(coltypes == "integer")
-
-liftdata[, intcols] <- sapply(liftdata[, intcols], as.numeric)
-
+liftdata <- cleanColumns(liftdata, na.frac.limit)$df
 
 datacol.ind <- 8:ncol(liftdata)
 
+resultcol <- match("classe", names(liftdata))
+featurecols <- setdiff(datacol.ind, resultcol)
 ```
 
 ```{r initforeach}
@@ -92,6 +123,8 @@ library(doMC)
 registerDoSEQ()
 
 # Create a function for initalizing a seed list (for reproducibility)
+# Note: in order to produce a reproducible seed list, the random
+# seed must be set using set.seed() before calling this function
 createSeedList <- function(nrand, ntune)
 {
     seeds <- vector(mode = "list", length = nrand + 1)
@@ -107,9 +140,15 @@ createSeedList <- function(nrand, ntune)
 
 # Introduction
 
-This report presents a statistical model for interpreting human activity data. More specifically, the aim is to determine from accelerometer data whether a weight lifting exercise was performed correctly or not.
+This report presents a statistical model for interpreting human activity data. More specifically, the aim is to determine from accelerometer data whether a weight lifting exercise was performed correctly or not. The data is from the Human Activity Recognition project. Several models will be fitted to the data and aggregated to obtain the final prediction.
 
-# Prediction model
+
+
+# Data acquisition and exploratory analysis
+
+## Data cleaning
+
+The original data included 7 columns of identifying information, 112 feature columns, and a result column indicating the classification (a letter in the range A--E). However, many columns consisted primarily of empty or NA values. Feature olumns with more than `r round(na.frac.limit*100)` % NAs were dropped, resulting in `r length(featurecols)` feature columns.
 
 ## Training, testing, and validation data
 
@@ -126,6 +165,24 @@ testing <- test.valid[inTest, ]
 validation <- test.valid[-inTest, ]
 ```
 
+
+## Exploratory analysis
+
+The plot below shows the (centered and scaled) values of each feature variable in the training dataset, separately for each lifting method.
+
+```{r explore, cache=TRUE, fig.height=16, fig.width=10}
+
+feat.scaled <- predict(preProcess(training[, featurecols],
+                                  method = c("center", "scale")),
+                       training[, featurecols])
+
+featurePlot(feat.scaled, training[, resultcol], plot = "box")
+```
+
+The feature plot does not show any immediately obvious features separating the different classes. However, it is expected that more sophisticated machine learning algorithms may be trained to reliably classify different lifting types based on the accelerometer data.
+
+# Prediction model
+
 ## Cross-validation parameters
 
 ```{r cvpar, cache=TRUE}
@@ -139,7 +196,7 @@ nrepeat <- 5L
 The out-of-sample error of the prediction models is estimated using repeated
 cross-validation with `r nfold` folds, repeated `r nrepeat` times for each model.
 
-## Prediction by linear discriminant analysis
+## Linear discriminant analysis
 
 ```{r pred.lda, cache=TRUE, dependson='cvpar'}
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
@@ -154,14 +211,10 @@ pred.testing.lda <- predict(mod.lda, testing)
 ```{r}
 print(mod.lda)
 
-#library(MASS)
-
-#plot(mod.lda$finalModel)
-
 confusionMatrix(pred.testing.lda, testing$classe)
 ```
 
-## Prediction using a tree
+## Tree
 
 ```{r pred.tree, cache=TRUE}
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
@@ -183,12 +236,12 @@ confusionMatrix(pred.testing.tree, testing$classe)
 
 ```
 
-## Prediction using boosting (GBM)
+## Boosting (GBM)
 
 ```{r pred.gbm, cache=TRUE, dependson='cvpar'}
 # Parameter tuning grid
-tunegrid <- expand.grid(interaction.depth=c(2, 3, 4, 5),
-                        n.trees = c(50, 100, 150, 200, 250, 300))
+tunegrid <- expand.grid(interaction.depth=c(5, 6),
+                        n.trees = c(200, 400))
 tunegrid <- cbind(tunegrid, shrinkage = 0.1, n.minobsinnode = 10)
 
 set.seed(0132)
@@ -217,11 +270,13 @@ print(mod.gbm)
 varImp(mod.gbm)
 
 plot(mod.gbm$finalModel)
+
+confusionMatrix(pred.testing.gbm, testing$classe)
 ```
 
 Execution time: `r (t2gbm-t1gbm)["elapsed"]`
 
-## Prediction using random forest
+## Random forest
 
 ```{r pred.rf, cache=TRUE, dependson='cvpar'}
 # Using the formula method for rf seems to be very slow; sources suggest
@@ -236,12 +291,6 @@ set.seed(5456)
 
 tuneLength = 5L # rf has only one parameter tuned by caret (mtry)
 
-#seeds <- vector(mode = "list", length = nfold*nrepeat + 1)
-
-#for (i in 1:(nfold*nrepeat)) seeds[[i]] <- sample.int(10000, tuneLength)
-
-#seeds[[nfold*nrepeat + 1]] <- sample.int(10000, 1)
-
 seeds <- createSeedList(nfold*nrepeat, tuneLength)
 
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat,
@@ -251,8 +300,12 @@ t1rf <- proc.time()
 
 rfdata <- training[, setdiff(datacol.ind, match("classe", names(training)))]
 mod.rf <- train(y = training$classe, x = rfdata,
-                method = "rf", trControl = trC, do.trace = TRUE, ntree = 250,
+                method = "rf", trControl = trC, ntree = 150,
                 tuneLength = tuneLength)
+
+# Return to sequential processing
+registerDoSEQ()
+
 
 t2rf <- proc.time()
 
@@ -265,20 +318,139 @@ t3rf <- proc.time()
 ```{r}
 print(mod.rf)
 
-#plot(mod.rf$finalModel)
-
-class(mod.rf$finalModel)
-
 varImp(mod.rf)
 
 varImpPlot(mod.rf$finalModel)
 
 confusionMatrix(pred.testing.rf, testing$classe)
 
-plot(mod.rf$finalModel)
+plot(mod.rf$finalModel, log = "y")
 ```
 
 Execution time: `r (t2rf-t1rf)["elapsed"]`
+
+## Combining results from GBM and random forest
+
+```{r}
+
+set.seed(51310)
+
+gbm.rf.agree <- pred.testing.gbm == pred.testing.rf
+
+confusionMatrix(pred.testing.rf[gbm.rf.agree], testing[gbm.rf.agree, "classe"])
+
+probs.gbm <- predict(mod.gbm, testing, type = "prob")
+names(probs.gbm) <- paste(names(probs.gbm), "gbm", sep = ".")
+probs.rf <- predict(mod.rf, testing, type = "prob")
+names(probs.rf) <- paste(names(probs.rf), "rf", sep = ".")
+
+probsdf <- cbind(probs.gbm, probs.rf, classe = testing$classe)
+
+probsdf.diff <- probsdf[!gbm.rf.agree, ]
+
+#mod.lda.comb <- train(classe ~ ., probsdf, method = "lda",
+#                      trControl = trainControl(method = "cv", number = nfold))
+mod.lda.diff.comb <- train(classe ~ ., probsdf.diff, method = "lda",
+                      trControl = trainControl(method = "none"))
+
+#pred.lda.comb <- predict(mod.lda.comb, probsdf)
+#confusionMatrix(pred.lda.comb, probsdf$classe)
+
+pred.lda.diff.comb <- predict(mod.lda.diff.comb, probsdf.diff)
+confusionMatrix(pred.lda.diff.comb, probsdf.diff$classe)
+
+pred.comb <- pred.testing.rf
+pred.comb[!gbm.rf.agree] <- pred.lda.diff.comb
+
+confusionMatrix(pred.comb, testing$classe)
+
+```
+
+## Model validation
+
+```{r}
+
+pred.validation.gbm <- predict(mod.gbm, validation)
+pred.validation.rf <- predict(mod.rf, validation)
+
+validation.agree <- pred.validation.gbm == pred.validation.rf
+
+probs.validation.gbm <- predict(mod.gbm, validation, type = "prob")
+probs.validation.rf <- predict(mod.rf, validation, type = "prob")
+
+names(probs.validation.gbm) <- paste(names(probs.validation.gbm),
+                                     "gbm", sep = ".")
+names(probs.validation.rf) <- paste(names(probs.validation.rf),
+                                    "rf", sep = ".")
+
+probsdf.validation <- cbind(probs.validation.gbm, probs.validation.rf)
+probsdf.diff.validation <- probsdf[!validation.agree, ]
+
+pred.validation.diff.lda <- predict(mod.lda.diff.comb, probsdf.diff.validation)
+
+pred.validation.comb <- pred.validation.rf
+pred.validation.comb[!validation.agree] <- pred.validation.diff.lda
+
+confusionMatrix(pred.validation.rf, validation$classe)
+
+confusionMatrix(pred.validation.comb, validation$classe)
+```
+
+# Prediction of unknown results
+
+```{r predict}
+predictiondata <- cleanColumns(predictiondata, na.frac.limit)$df
+
+predcol.ind <- 8:ncol(predictiondata)
+
+resultcol.pred <- match("problem_id", names(predictiondata))
+featurecols.pred <- setdiff(predcol.ind, resultcol)
+
+pred.prediction.gbm <- predict(mod.gbm, predictiondata)
+pred.prediction.rf <- predict(mod.rf, predictiondata)
+
+prediction.agree <- pred.prediction.gbm == pred.prediction.rf
+
+pred.prediction.comb <- pred.prediction.rf
+
+if (!all(prediction.agree))
+{
+    probs.prediction.gbm <- predict(mod.gbm, predictiondata, type = "prob")
+    probs.prediction.rf <- predict(mod.rf, predictiondata, type = "prob")
+    
+    names(probs.prediction.gbm) <- paste(names(probs.prediction.gbm),
+                                         "gbm", sep = ".")
+    names(probs.prediction.rf) <- paste(names(probs.prediction.rf),
+                                        "rf", sep = ".")
+
+    probsdf.prediction <- cbind(probs.prediction.gbm, probs.prediction.rf)
+    probsdf.diff.prediction <- probsdf[!prediction.agree, ]
+
+    pred.prediction.diff.lda <- predict(mod.lda.diff.comb, probsdf.diff.prediction)
+
+    pred.prediction.comb[!prediction.agree] <- pred.prediction.diff.lda
+}
+
+predictiondf <- data.frame(problem_id = predictiondata$problem_id,
+                           predicted.comb = as.character(pred.prediction.comb),
+                           predicted.gbm = as.character(pred.prediction.gbm),
+                           predicted.rf = as.character(pred.prediction.rf))
+```
+
+```{r results="asis"}
+if (all(prediction.agree))
+{
+    kable(predictiondf[, 1:2],
+          col.names = c("Problem ID", "Predicted class"),
+          caption = "Predicted activity classes")
+} else
+{
+    kable(predictiondf,
+          col.names = c("Problem ID", "Predicted class (stack)",
+                        "Predicted class (GBM)", "Predicted class (RF)"),
+          caption = "Predicted activity classes")
+}
+```
 
 # Sources
 
