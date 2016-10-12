@@ -1,7 +1,7 @@
 ---
 title: "Predicting weight lifting method via accelerometry data"
 author: "Timo Voipio"
-date: "21 Sep 2016"
+date: "12 Oct 2016"
 output: html_document
 ---
 
@@ -31,7 +31,7 @@ options(scipen = 3)
 
 if (tidydoc)
 {
-    opts_chunk$set(echo=FALSE, warnings=FALSE, messages=FALSE)
+    opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
 }
 ```
 
@@ -113,7 +113,7 @@ resultcol <- match("classe", names(liftdata))
 featurecols <- setdiff(datacol.ind, resultcol)
 ```
 
-```{r initforeach}
+```{r initforeach, message=FALSE}
 # Initialize parallel or sequential backend for 'foreach'
 
 library(doMC)
@@ -152,7 +152,7 @@ The original data included 7 columns of identifying information, 112 feature col
 
 ## Training, testing, and validation data
 
-```{r partdata}
+```{r partdata, cache=TRUE}
 
 inTrain <- createDataPartition(liftdata$classe, p = 0.6, list = FALSE)
 
@@ -165,6 +165,7 @@ testing <- test.valid[inTest, ]
 validation <- test.valid[-inTest, ]
 ```
 
+The "training" dataset was partitioned into three sets: training, testing, and validation in a 60/20/20 scheme. The resulting datasets include `r nrow(training)`, `r nrow(testing)`, and `r nrow(validation)` observations, respectively. The partitioning was done using the funciton `createDataPartition` from the `caret` package in order to ensure that each partition contained proportional amounts of the different lifting methods.
 
 ## Exploratory analysis
 
@@ -172,6 +173,7 @@ The plot below shows the (centered and scaled) values of each feature variable i
 
 ```{r explore, cache=TRUE, fig.height=16, fig.width=10}
 
+# Scale and center feature variables (for plotting purposes only)
 feat.scaled <- predict(preProcess(training[, featurecols],
                                   method = c("center", "scale")),
                        training[, featurecols])
@@ -181,7 +183,12 @@ featurePlot(feat.scaled, training[, resultcol], plot = "box")
 
 The feature plot does not show any immediately obvious features separating the different classes. However, it is expected that more sophisticated machine learning algorithms may be trained to reliably classify different lifting types based on the accelerometer data.
 
+
 # Prediction model
+
+The prediction model is constructed using the framework provided by the `caret` package. Several different models are evaluated in order to achieve the best possible fit, without succumbing to excessive overfitting.
+
+The goal of the prediction model is to predict correctly 20 different cases. If the probability of predicting a single case correctly is $p$, the probability of predicting all cases correctly is $p^{20}$. As a result, if the probability of predicting all cases correctly is required to be at least 50 %, the accuracy of a single-case prediction has to be at least `r round((0.5^0.05)*100, 1)` %, and for a compound probability of 90 % the accuracy threshold is `r round((0.9^0.05)*100, 1)` %. In practical terms, this means that any model with prediction accuracy of less than 90 % (with reasonable computational effort) is discarded outright from further consideration.
 
 ## Cross-validation parameters
 
@@ -194,11 +201,11 @@ nrepeat <- 5L
 ```
 
 The out-of-sample error of the prediction models is estimated using repeated
-cross-validation with `r nfold` folds, repeated `r nrepeat` times for each model.
+cross-validation with `r nfold` folds, repeated `r nrepeat` times for each model, and by using the testing set. The repeated cross-validation is also used by the `train` function to optimize the model parameters, if any.
 
 ## Linear discriminant analysis
 
-```{r pred.lda, cache=TRUE, dependson='cvpar'}
+```{r pred.lda, cache=TRUE, dependson=c("cvpar", "partdata")}
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
 
 mod.lda <- train(classe ~ ., training[, datacol.ind], method = "lda",
@@ -208,15 +215,29 @@ pred.lda <- predict(mod.lda, training)
 pred.testing.lda <- predict(mod.lda, testing)
 ```
 
-```{r}
-print(mod.lda)
+The first shot at prediction is taken with the linear discriminant analysis (LDA). The model is constructed in a very reasonable amount of computing time; however, the accuracy as predicted by cross-validation is only `r round(mod.lda$results$Accuracy * 100, 1)` %, SD `r round(mod.lda$results$AccuracySD * 100, 1)` %.
 
-confusionMatrix(pred.testing.lda, testing$classe)
+```{r}
+# print(mod.lda)
+
+confmat.lda <- confusionMatrix(pred.testing.lda, testing$classe)
 ```
+
+For the testing dataset, the accuracy is `r round(confmat.lda$overall["Accuracy"]*100, 1)` %. This much less than the hard accuracy threshold of 90 %, so LDA is not retained for further consideration. The subpar performance of LDA in this case is not unexpected, as no domain knowledge has been applied to select only revant features. Additionally, it is questionable whether the features available for prediction are even approximately normally distributed, which is a central assumption made in LDA.
+
+<style type="text/css">
+.table {
+
+    width: 40%;
+
+}
+</style>
 
 ## Tree
 
-```{r pred.tree, cache=TRUE}
+Next, a CART decision tree is evaluated as a predictive model using the `rpart` method in `train`.
+
+```{r pred.tree, cache=TRUE, dependson=c("cvpar", "partdata")}
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
 
 mod.tree <- train(classe ~ ., training[, datacol.ind], method = "rpart", metric = "Accuracy", trControl = trC)
@@ -226,37 +247,56 @@ pred.testing.tree <- predict(mod.tree, testing)
 ```
 
 ```{r}
-print(mod.tree)
+best.tree <- which.max(mod.tree$results$Accuracy)
+```
+
+The cross-validated accuracy for the decision tree is `r round(mod.tree$results$Accuracy[best.tree]*100, 1)` % (SD `r round(mod.tree$results$AccuracySD[best.tree]*100, 1)` %), and the complexity parameter selected by cross-validation is `r signif(mod.tree$results$cp[best.tree], 3)`. The accuracy is even worse than that achieved with LDA.
+
+```{r}
+#print(mod.tree)
 
 #library(rpart)
 
 #plot(mod.tree$finalModel)
 
-confusionMatrix(pred.testing.tree, testing$classe)
+confmat.tree <- confusionMatrix(pred.testing.tree, testing$classe)
+```
+
+The prediction accuracy for the testing dataset is `r round(confmat.tree$overall["Accuracy"]*100, 1)` %, which within one standard deviation of the prediction given by cross-validation within the training set. The prediction is far below what is required for succesfully predicting the 20 unknown cases. The confusion matrix for the testing set is
+
+```{r results="asis"}
+
+tree.table <- confmat.tree$table
+
+dimnames(tree.table)[["Prediction"]] <-
+    paste0(dimnames(tree.table)[["Prediction"]], "pred")
+dimnames(tree.table)[["Reference"]] <-
+    paste0(dimnames(tree.table)[["Reference"]], "ref")
+kable(tree.table)
 
 ```
 
+Class A seems to be predicted rather reliably, but the accuracy for other classes is not good at all. Accuracy for class D is zero, with none of the occcurrences predicted correctly.
+
+It seems clear that a simple decision tree is not sufficient for this model, so more computationally demanding aggregate models are constructed.
+
 ## Boosting (GBM)
 
-```{r pred.gbm, cache=TRUE, dependson='cvpar'}
+```{r pred.gbm, cache=TRUE, dependson=c("cvpar", "partdata")}
 # Parameter tuning grid
-tunegrid <- expand.grid(interaction.depth=c(5, 6),
+tunegrid <- expand.grid(interaction.depth=c(4, 6),
                         n.trees = c(200, 400))
 tunegrid <- cbind(tunegrid, shrinkage = 0.1, n.minobsinnode = 10)
 
 set.seed(0132)
-npar = nrow(tunegrid)
+npar <- nrow(tunegrid)
 seeds.gbm <- createSeedList(nfold*nrepeat, npar)
 
 registerDoMC(4)
 
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat)
 
-t1gbm <- proc.time()
-
-mod.gbm <- train(classe ~ ., training[, datacol.ind], method = "gbm", metric = "Accuracy", trControl = trC, tuneGrid = tunegrid)
-
-t2gbm <- proc.time()
+mod.gbm <- train(classe ~ ., training[, datacol.ind], method = "gbm", metric = "Accuracy", trControl = trC, tuneGrid = tunegrid, verbose = FALSE)
 
 pred.gbm <- predict(mod.gbm, training)
 pred.testing.gbm <- predict(mod.gbm, testing)
@@ -264,21 +304,40 @@ pred.testing.gbm <- predict(mod.gbm, testing)
 registerDoSEQ()
 ```
 
+The next model is to be evaluated is a `gbm` in `caret` package, which uses gradient boosting on (shallow) decision trees to obtain a more accurate model than a single tree. The algorithm works iteratively, always giving more weight on those observations which were mispredicted on the previous rounds.
+
+Cross-validation is used to tune the model. Based on a trial run of `train` on the training data and the values automatically chosen by `caret`, the parameter space was chosen such that all combinations of the values given in the table below were considered by the GBM algorithm.
+
+```{r results="asis"}
+tunegrid.vals <- lapply(tunegrid, unique)
+tunegrid.df <- data.frame(param.name = names(tunegrid.vals),
+                          param.values =
+                              sapply(tunegrid.vals,
+                                     function(x) paste(x, collapse = ", "))
+                          )
+kable(tunegrid.df, row.names = FALSE, col.names = c("Parameter name", "Parameter values"))
+
+best.gbm <- which.max(mod.gbm$results$Accuracy)
+best.gbm.res <- mod.gbm$results[best.gbm, ]
+```
+
+Based on cross-validation, the estimated accuracy of the final (post-tuning) model is `r round(best.gbm.res["Accuracy"]*100, 3)` % (SD `r round(best.gbm.res["AccuracySD"]*100, 3)` %). This result was achieved with `interaction.depth` and `n.trees` equal to `r best.gbm.res["interaction.depth"]` and `r best.gbm.res["n.trees"]`, respectively. The variable importance of the 20 most important features is shown below.
+
 ```{r}
-print(mod.gbm)
+#print(mod.gbm)
 
 varImp(mod.gbm)
 
-plot(mod.gbm$finalModel)
+#plot(mod.gbm$finalModel)
 
-confusionMatrix(pred.testing.gbm, testing$classe)
+confmat.gbm <- confusionMatrix(pred.testing.gbm, testing$classe)
 ```
 
-Execution time: `r (t2gbm-t1gbm)["elapsed"]`
+The prediction accuracy for the testing set is `r round(confmat.gbm$overall["Accuracy"]*100, 1)` %. The error rate has thus decreased by two orders of magnitude when compared to a single decision tree. However, the increased accuracy comes at a cost, with the elapsed ("wall clock") time for the whole training process, tuning included, being `r round(mod.gbm$times$everything["elapsed"])` seconds; the training time for the final model (post tuning) was `r round(mod.gbm$times$final["elapsed"])` s.
 
 ## Random forest
 
-```{r pred.rf, cache=TRUE, dependson='cvpar'}
+```{r pred.rf, cache=TRUE, dependson=c("cvpar", "partdata")}
 # Using the formula method for rf seems to be very slow; sources suggest
 # using the y = ..., x = ... format instead.
 #mod.rf <- train(classe ~ ., training[, datacol.ind], method = "rf", mtry = 1)
@@ -290,44 +349,60 @@ registerDoMC(4)
 set.seed(5456)
 
 tuneLength = 5L # rf has only one parameter tuned by caret (mtry)
+rf.ntree = 150 # Number of trees
+
 
 seeds <- createSeedList(nfold*nrepeat, tuneLength)
 
 trC <- trainControl(method = "repeatedcv", number = nfold, repeats = nrepeat,
                     seeds = seeds, allowParallel = TRUE)
 
-t1rf <- proc.time()
-
 rfdata <- training[, setdiff(datacol.ind, match("classe", names(training)))]
 mod.rf <- train(y = training$classe, x = rfdata,
-                method = "rf", trControl = trC, ntree = 150,
+                method = "rf", trControl = trC, ntree = rf.ntree,
                 tuneLength = tuneLength)
 
 # Return to sequential processing
 registerDoSEQ()
 
-
-t2rf <- proc.time()
-
 pred.rf <- predict(mod.rf, training)
 pred.testing.rf <- predict(mod.rf, testing)
-
-t3rf <- proc.time()
 ```
 
+The aptly named random forest consists of a collection of fully grown decision trees. Key differences to boosted trees are the tree size (RF uses fully grown trees) and non-iterative nature of the forest growth. The randomness is introduced to the process by picking, for each tree, a random subset of variables which are considered when growing that tree.
+
+The random forest model is formed using `train` with the method `rf`, which uses the `randomForest` package. The only parameter tuned by `train` is `mtry`, the number of variables used for each tree. The `train` package was allowed to pick `r tuneLength` candidate values and choose the best one based on cross-validation.
+
 ```{r}
-print(mod.rf)
+best.rf <- which.max(mod.rf$results$Accuracy)
+best.rf.res <- mod.gbm$results[best.rf, ]
+```
+
+Based on repeated cross-validation, the estimated accuracy of the final (post-tuning) model is `r round(best.rf.res["Accuracy"]*100, 3)` % (SD `r round(best.rf.res["AccuracySD"]*100, 3)` %), achieved with $m_\textrm{try} = `r mod.rf$finalModel$mtry`$.
+
+The variable importance is shown below for the 20 most important variables.
+
+```{r}
+#print(mod.rf)
 
 varImp(mod.rf)
 
-varImpPlot(mod.rf$finalModel)
+#varImpPlot(mod.rf$finalModel)
 
-confusionMatrix(pred.testing.rf, testing$classe)
-
-plot(mod.rf$finalModel, log = "y")
+confmat.rf <- confusionMatrix(pred.testing.rf, testing$classe)
 ```
 
-Execution time: `r (t2rf-t1rf)["elapsed"]`
+It is observed that especially the variables near the top are the same as for GBM.
+
+The plot below shows the estimated out of sample error for each value of $m_\textrm{try}$ evaluated by `train`. The best one clearly outperforms the other values of $m_\textrm{try}$ (note the logarithmic scale). Also, it can be seen that the error is unlikely to decrease further even if the number of trees were decreased.
+
+```{r plotrf}
+plot(mod.rf$finalModel, log = "y", main = "Model error")
+```
+
+The prediction accuracy for the testing set is `r round(confmat.rf$overall["Accuracy"]*100, 1)` %. This is comparable to the the accuracy obtained via boosting. The total elapsed time for the RF training, including tuning, was `r round(mod.rf$times$everything["elapsed"])` seconds; the training time for the final model (post tuning) was `r round(mod.rf$times$final["elapsed"])` s. These are considerably shorter times than for GBM, even though the size of the parameter space was larger (`r tuneLength` for RF, `r prod(sapply(tunegrid.vals, length))` for GBM). 
+
+
 
 ## Combining results from GBM and random forest
 
@@ -337,7 +412,7 @@ set.seed(51310)
 
 gbm.rf.agree <- pred.testing.gbm == pred.testing.rf
 
-confusionMatrix(pred.testing.rf[gbm.rf.agree], testing[gbm.rf.agree, "classe"])
+confmat.agree.comb <- confusionMatrix(pred.testing.rf[gbm.rf.agree], testing[gbm.rf.agree, "classe"])
 
 probs.gbm <- predict(mod.gbm, testing, type = "prob")
 names(probs.gbm) <- paste(names(probs.gbm), "gbm", sep = ".")
@@ -357,14 +432,30 @@ mod.lda.diff.comb <- train(classe ~ ., probsdf.diff, method = "lda",
 #confusionMatrix(pred.lda.comb, probsdf$classe)
 
 pred.lda.diff.comb <- predict(mod.lda.diff.comb, probsdf.diff)
-confusionMatrix(pred.lda.diff.comb, probsdf.diff$classe)
+confmat.diff.comb <- confusionMatrix(pred.lda.diff.comb, probsdf.diff$classe)
 
 pred.comb <- pred.testing.rf
 pred.comb[!gbm.rf.agree] <- pred.lda.diff.comb
 
-confusionMatrix(pred.comb, testing$classe)
-
+confmat.comb <- confusionMatrix(pred.comb, testing$classe)
 ```
+
+In a bid to obtain an even more accurate result than those from GBM or RF, their result are combined by using linear discriminant analysis. The main idea is to use the LDA model to break the ties on cases where RF and GBM yield different class predictions. The LDA model does not use the original accelerometer data as inputs, but rather the class probabilities from the GBM and RF models, as given by `predict(model, newdata, type = "prob")`.
+
+The combining model is trained using the testing dataset. The training process works as follows:
+
+1. Class probabilities are calculated for each observation in the testing dataset using both GBM and RF models.
+2. The observations are divided into two datasets: those for which GBM and RF yield the same prediction (`agree` set) and those for which the predictions differ (`differ` set).
+3. The `differ` set is used to train a model to predict the class variable based on the class probability for each of the classes A-E using linear discriminant analysis.
+
+The combining model cannot be invoked directly via `caret`'s `predict` function (even though this could be possible by writing a custom method). The following steps are required to obtain the final, combined prediction:
+
+1. Class predictions and class probabilities are calculated using both GBM and RF models.
+2. The predictions are divided into two sets, as above: `agree` set and `differ` set
+3. The LDA model is applied on the class probabilities to obtain class predictions
+4. The predictions in the `agree` set and those given by the LDA model on the `differ` set are combined and are treated as the final prediction.
+
+It should be noted that the number of observations in the `differ` set is very small (in this case, `r sum(!gbm.rf.agree)`); therefore no resampling is attempted to determine the accuracy of the model. The combining model's accuracy on the set on which it was trained is `r round(confmat.diff.comb$overall["Accuracy"]*100, 1)` %. It is therefore expected that using this combining model to break ties between GBM and RF results will improve the prediction accuracy at least slightly. Cases where both GBM and RF arrive to the same wrong prediction are not affected at all. In this case, accuracy on the testing set was `r round(confmat.comb$overall["Accuracy"]*100, 1)` %. A more complete evaluation on the accuracy may be obtained using the validation dataset, which has so far been untouched.
 
 ## Model validation
 
@@ -391,10 +482,13 @@ pred.validation.diff.lda <- predict(mod.lda.diff.comb, probsdf.diff.validation)
 pred.validation.comb <- pred.validation.rf
 pred.validation.comb[!validation.agree] <- pred.validation.diff.lda
 
-confusionMatrix(pred.validation.rf, validation$classe)
+confmat.validation.gbm <- confusionMatrix(pred.validation.gbm, validation$classe)
+confmat.validation.rf <- confusionMatrix(pred.validation.rf, validation$classe)
 
-confusionMatrix(pred.validation.comb, validation$classe)
+confmat.validation.comb <- confusionMatrix(pred.validation.comb, validation$classe)
 ```
+
+The validation dataset yields accuracies of `r round(confmat.validation.gbm$overall["Accuracy"]*100, 1)` %, `r round(confmat.validation.rf$overall["Accuracy"]*100, 1)` %, and `r round(confmat.validation.comb$overall["Accuracy"]*100, 1)` % for GBM, RF, and the combining model, respectively. While the accuracy improvement is only a fraction of a percentage point, the estimated probability of predicting 20 cases correctly increases much faster than the accuracy; in the same order, the said estimated probabilities are `r round((confmat.validation.gbm$overall["Accuracy"]^20)*100, 1)` %, `r round((confmat.validation.rf$overall["Accuracy"]^20)*100, 1)` %, and `r round((confmat.validation.comb$overall["Accuracy"]^20)*100, 1)` %. The slight increase in the accuracy of the prediction has resulted in a significant increase in the probability that all 20 cases are predicted correctly.
 
 # Prediction of unknown results
 
@@ -437,7 +531,9 @@ predictiondf <- data.frame(problem_id = predictiondata$problem_id,
                            predicted.rf = as.character(pred.prediction.rf))
 ```
 
-```{r results="asis"}
+After these preliminaries, the established stacked model (GBM and RF, ties broken with LDA on class probabilities) is used to classify the 20 observations for which the activity type is not known, with the following results:
+
+```{r results="asis", eval=FALSE}
 if (all(prediction.agree))
 {
     kable(predictiondf[, 1:2],
@@ -451,6 +547,10 @@ if (all(prediction.agree))
           caption = "Predicted activity classes")
 }
 ```
+
+(results redacted from this version of the document)
+
+GBM and RF models agreed in all cases, so the LDA model was not actually applied in any of the cases. This is not entirely unexpected, as, for example, in the validation dataset only `r round(mean(!validation.agree)*100, 1)` % of the observations resulted in disagreement between RF and LDA.
 
 # Sources
 
